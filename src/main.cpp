@@ -5,9 +5,36 @@
 #include <iostream>
 #include <thread>
 #include <vector>
+#include <algorithm>
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
+
+// UNIT CONVERSIONS
+#define KPH2MPS(x) (double)x / 3.6                             //
+#define MPH2MPS(x) KPH2MPS((double)x*8./5.)                    //
+
+#define TIME_STEP_sec (double)0.02                             // 20ms
+#define MAX_TARGET_SPEED_MPS KPH2MPS((double)80.0 * (1-0.05))  // 80 kph * 3.6 mps/kph, 5% margin
+#define LANE_WIDTH_M 4.0                                       // nominal lane width is 4.0m
+#define GETLANE(d) ((int)d / LANE_WIDTH_M)                     // given d, return lane
+#define MAX_ACCELERATION_MPSS (double)10.0 * (1-0.25)          // 10 mpss given in requirements, 25% margin
+#define MAX_JERK_MPSSS (double)50.0 * (1-0.25)                 // 50 mpsss given in requirements, 25% margin
+
+enum sensor_fusion_t { ID, PX, PY, VX, VY, S, D};
+enum lane_t {left_lane, middle_lane, right_lane, num_lanes};
+
+struct target_vehicle_struct {
+  int ID;
+  int lane;
+  double deltaS = 9999; //initialize to arbitrary large number
+  double longvel;
+};
+
+bool compare_target_vehicle_struct(const target_vehicle_struct &first, const target_vehicle_struct &second) {
+  return (first.deltaS < second.deltaS);
+}
 
 using namespace std;
 
@@ -200,8 +227,8 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
-                     uWS::OpCode opCode) {
+  h.onMessage([&map_waypoints_x, &map_waypoints_y, &map_waypoints_s, &map_waypoints_dx, &map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+    uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
     // The 2 signifies a websocket event
@@ -213,44 +240,204 @@ int main() {
 
       if (s != "") {
         auto j = json::parse(s);
-        
+
         string event = j[0].get<string>();
-        
+
         if (event == "telemetry") {
           // j[1] is the data JSON object
-          
-        	// Main car's localization Data
-          	double car_x = j[1]["x"];
-          	double car_y = j[1]["y"];
-          	double car_s = j[1]["s"];
-          	double car_d = j[1]["d"];
-          	double car_yaw = j[1]["yaw"];
-          	double car_speed = j[1]["speed"];
 
-          	// Previous path data given to the Planner
-          	auto previous_path_x = j[1]["previous_path_x"];
-          	auto previous_path_y = j[1]["previous_path_y"];
-          	// Previous path's end s and d values 
-          	double end_path_s = j[1]["end_path_s"];
-          	double end_path_d = j[1]["end_path_d"];
+          // Main car's localization Data
+          double ego_px = j[1]["x"];
+          double ego_py = j[1]["y"];
+          double ego_s = j[1]["s"];
+          double ego_d = j[1]["d"];
+          double ego_heading_rad = deg2rad(j[1]["yaw"]);
+          double ego_longvel_mps = MPH2MPS(j[1]["speed"]);
 
-          	// Sensor Fusion Data, a list of all other cars on the same side of the road.
-          	auto sensor_fusion = j[1]["sensor_fusion"];
+          // Previous path data given to the Planner
+          auto previous_path_x = j[1]["previous_path_x"];
+          auto previous_path_y = j[1]["previous_path_y"];
 
-          	json msgJson;
+          // Previous path's end s and d values 
+          double end_path_s = j[1]["end_path_s"];
+          double end_path_d = j[1]["end_path_d"];
 
-          	vector<double> next_x_vals;
-          	vector<double> next_y_vals;
+          // Sensor Fusion Data, a list of all other cars on the same side of the road.
+          auto sensor_fusion = j[1]["sensor_fusion"];
+
+          json msgJson;
+
+          int ego_lane = GETLANE(ego_d);
+
+          // GET NEAREST TARGET VEHICLE IN EACH LANE AND *AHEAD* OF EGO VEHICLE
+          // TODO: CONSIDER FASTER TRAFFIC APPROACHING FROM BEHIND WHEN PLANNING LANE CHANGE
+          vector < target_vehicle_struct> ClosestTrafficParticipant_in_lane(num_lanes);
+
+          for (int i = 0; i < sensor_fusion.size(); i++) {
+            target_vehicle_struct target_vehicle;
+
+            target_vehicle.ID = sensor_fusion[i][ID];
+            target_vehicle.lane = GETLANE(sensor_fusion[i][D]);
+            target_vehicle.longvel = sqrt(pow((double)sensor_fusion[i][VX], 2) + pow((double)sensor_fusion[i][VY], 2));
+            target_vehicle.deltaS = (double)sensor_fusion[i][S] - ego_s;
+
+            if (target_vehicle.deltaS > 0) { // target in front of ego vehicle
+              if (target_vehicle.deltaS < ClosestTrafficParticipant_in_lane[target_vehicle.lane].deltaS) {
+                ClosestTrafficParticipant_in_lane[target_vehicle.lane] = target_vehicle;
+              }
+            }
+          }
+          //cout << "Lane " << ego_lane+1 << ":\t" << "ID: " << ClosestTrafficParticipant_in_lane[ego_lane].ID << "\tdeltaS: " << ClosestTrafficParticipant_in_lane[ego_lane].deltaS << endl;
+
+          // Initialize goal state to stay in lane
+          double goal_longvel = MAX_TARGET_SPEED_MPS;
+          int goal_lane = middle_lane;  
+
+#if(0)
+          // TODO: use state machine, build a path for each possible transition, calculate cost function, and then choose state with lowest cost
+          if (left_lane == ego_lane) { //check straight and LCR
+            //if ego slow
+            if (   ego_longvel_mps < goal_longvel \
+                && ClosestTrafficParticipant_in_lane[middle_lane].longvel > ego_longvel_mps) { 
+              goal_lane = middle_lane;
+            }
+          }
+          else if (middle_lane == ego_lane) { // check straight, LCR, and LCL
+            if (ego_longvel_mps < goal_longvel \
+              && ClosestTrafficParticipant_in_lane[right_lane].longvel > ego_longvel_mps) {
+              goal_lane = right_lane;
+            }
+            if (ego_longvel_mps < goal_longvel \
+              && ClosestTrafficParticipant_in_lane[left_lane].longvel > ego_longvel_mps) {
+              goal_lane = left_lane;
+            }
+          }
+          else if (right_lane == ego_lane) { // check straight and LCL
+            if (ego_longvel_mps < goal_longvel \
+              && ClosestTrafficParticipant_in_lane[middle_lane].longvel > ego_longvel_mps) {
+              goal_lane = middle_lane;
+            }
+          }
+          else { // this is an error state - just continue straight
+          }
+#endif
+          //***********************************
+          // Build the PLANNINGPATH 
+          // Keep it simple with 4 points
+          // Trust spline to do the smoothing
+          //***********************************
+          vector<double> planningpath_x, planningpath_y; // ego vehicle x/y-position in global frame
+
+#if(0)
+          // Load up the planning path with the unused points from the previous path
+          for (int i = 0; i < previous_path_x.size(); i++) {
+            planningpath_x.push_back(previous_path_x[i]); 
+            planningpath_y.push_back(previous_path_y[i]);
+          }
+#endif
+          // POINT 1 - Include the vehicle's current position
+          planningpath_x.push_back(ego_px);
+          planningpath_y.push_back(ego_py);
+
+          // POINT 2 - Project where ego vehicle will be in the next TIME_STEP_sec, if driving at 10. km/h
+          planningpath_x.push_back(ego_px + KPH2MPS(10.)*cos(ego_heading_rad)*TIME_STEP_sec);
+          planningpath_y.push_back(ego_py + KPH2MPS(10.)*sin(ego_heading_rad)*TIME_STEP_sec);
+
+          // POINT 3 - Calculate the point 2 seconds ahead at max speed and in goal lane
+          vector<double> goal_xy;
+          goal_xy = getXY(ego_s + MAX_TARGET_SPEED_MPS*2.0, \
+            (goal_lane * 4) + 2, \
+            map_waypoints_s, \
+            map_waypoints_x, \
+            map_waypoints_y);
+          planningpath_x.push_back(goal_xy[0]);
+          planningpath_y.push_back(goal_xy[1]);
+
+          // POINT 4 - Calculate the point 2.5 seconds ahead at max speed and in goal lane
+          //vector<double> goal_xy;
+          goal_xy = getXY(ego_s + MAX_TARGET_SPEED_MPS*2.5, \
+                     (goal_lane*4) + 2, \
+                     map_waypoints_s, \
+                     map_waypoints_x, \
+                     map_waypoints_y);
+          planningpath_x.push_back(goal_xy[0]);
+          planningpath_y.push_back(goal_xy[1]);
+
+          // transform from global reference frame to ego vehicle reference frame
+          for (int i = 0; i < planningpath_x.size(); i++) {
+            // shift
+            planningpath_x[i] -= ego_px;
+            planningpath_y[i] -= ego_py;
+            // rotate
+            planningpath_x[i] =   planningpath_x[i] * cos(-ego_heading_rad) \
+                                - planningpath_y[i] * sin(-ego_heading_rad);
+            planningpath_y[i] =   planningpath_x[i] * sin(-ego_heading_rad) \
+                                + planningpath_y[i] * cos(-ego_heading_rad);
+          }
+
+          cout << planningpath_x[0] << "\t" << planningpath_y[0] << "\t" \
+               << planningpath_x[1] << "\t" << planningpath_y[1] << "\t" \
+               << planningpath_x[2] << "\t" << planningpath_y[2] << "\t" \
+               << planningpath_x[3] << "\t" << planningpath_y[3] << "\t" \
+               << endl;
+
+          //*********************************
+          // Build the planning_path_spline
+          //*********************************
+          tk::spline planning_path_spline;
+          planning_path_spline.set_points(planningpath_x, planningpath_y);
+
+          // ********************
+          // Build path request
+          // ********************
+          vector<double> next_x_vals, next_y_vals; // ego vehicle desired x/y-position in global frame, send to motion control / simulator
+
+          double future_ego_longvel = ego_longvel_mps;
+          double accel_demand, accel_demand_z1;
+
+          for (int i = 0; i < 50; i++) {
+            if (future_ego_longvel < goal_longvel) { // need to accelerate
+              accel_demand = (goal_longvel - future_ego_longvel) * MAX_ACCELERATION_MPSS;
+            } else if (future_ego_longvel > goal_longvel) { // need to decelerate
+              accel_demand = (goal_longvel - future_ego_longvel) * MAX_ACCELERATION_MPSS;
+            } else { 
+              // maintain speed
+              accel_demand = 0.;
+            }
+
+            //limit jerk            
+            accel_demand = TIME_STEP_sec * max(-MAX_JERK_MPSSS, min(MAX_JERK_MPSSS, (accel_demand - accel_demand_z1) / TIME_STEP_sec));
+            future_ego_longvel += accel_demand * TIME_STEP_sec;
+            accel_demand_z1 = accel_demand;
+
+            double future_x, future_y; // future ego xy-position in vehicle frame
+            future_x = future_ego_longvel * i *TIME_STEP_sec;
+            future_y = planning_path_spline(future_x);
+
+            // swing back to global reference frame
+            // rotate
+            future_x =   future_x * cos(ego_heading_rad) \
+                       - future_y * sin(ego_heading_rad);
+            future_y =   future_x * sin(ego_heading_rad) \
+                       + future_y * cos(ego_heading_rad);
+
+            // shift
+            future_x += ego_px;
+            future_y += ego_py;
+
+            next_x_vals.push_back(future_x);
+            next_y_vals.push_back(future_y);
+          }
 
 
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
-          	msgJson["next_x"] = next_x_vals;
-          	msgJson["next_y"] = next_y_vals;
+          //END
+          msgJson["next_x"] = next_x_vals;
+          msgJson["next_y"] = next_y_vals;
 
-          	auto msg = "42[\"control\","+ msgJson.dump()+"]";
+          auto msg = "42[\"control\","+ msgJson.dump()+"]";
 
-          	//this_thread::sleep_for(chrono::milliseconds(1000));
-          	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
+          //this_thread::sleep_for(chrono::milliseconds(1000));
+          ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
           
         }
       } else {
