@@ -19,8 +19,8 @@
 #define MAX_TARGET_SPEED_MPS KPH2MPS((double)80.0 * (1-0.05))  // 80 kph * 3.6 mps/kph, 5% margin
 #define LANE_WIDTH_M 4.0                                       // nominal lane width is 4.0m
 #define GETLANE(d) ((int)d / LANE_WIDTH_M)                     // given d, return lane
-#define MAX_ACCELERATION_MPSS (double)10.0 * (1-0.25)          // 10 mpss given in requirements, 25% margin
-#define MAX_JERK_MPSSS (double)50.0 * (1-0.25)                 // 50 mpsss given in requirements, 25% margin
+#define MAX_ACCELERATION_MPSS (double)10.0 * (1.-0.25)          // 10 mpss given in requirements, 25% margin
+#define MAX_JERK_MPSSS (double)50.0 * (1.-0.25)                 // 50 mpsss given in requirements, 25% margin
 
 enum sensor_fusion_t { ID, PX, PY, VX, VY, S, D};
 enum lane_t {left_lane, middle_lane, right_lane, num_lanes};
@@ -326,22 +326,16 @@ int main() {
           // Keep it simple with 4 points
           // Trust spline to do the smoothing
           //***********************************
-          vector<double> planningpath_x, planningpath_y; // ego vehicle x/y-position in global frame
+          vector<double> planningpath_x_Fr0, planningpath_y_Fr0; // ego vehicle x/y-position in GLOBAL frame, Fr0
+		  vector<double> planningpath_x_Fr1, planningpath_y_Fr1; // ego vehicle x/y-position in EGO_VEHICLE frame, Fr1
 
-#if(0)
-          // Load up the planning path with the unused points from the previous path
-          for (int i = 0; i < previous_path_x.size(); i++) {
-            planningpath_x.push_back(previous_path_x[i]); 
-            planningpath_y.push_back(previous_path_y[i]);
-          }
-#endif
-          // POINT 1 - Include the vehicle's current position
-          planningpath_x.push_back(ego_px);
-          planningpath_y.push_back(ego_py);
+		  // POINT 1 - Include the vehicle's current position
+          planningpath_x_Fr0.push_back(ego_px);
+          planningpath_y_Fr0.push_back(ego_py);
 
           // POINT 2 - Project where ego vehicle will be in the next TIME_STEP_sec, if driving at 10. km/h
-          planningpath_x.push_back(ego_px + KPH2MPS(10.)*cos(ego_heading_rad)*TIME_STEP_sec);
-          planningpath_y.push_back(ego_py + KPH2MPS(10.)*sin(ego_heading_rad)*TIME_STEP_sec);
+          planningpath_x_Fr0.push_back(ego_px + KPH2MPS(10.)*cos(ego_heading_rad)*TIME_STEP_sec);
+          planningpath_y_Fr0.push_back(ego_py + KPH2MPS(10.)*sin(ego_heading_rad)*TIME_STEP_sec);
 
           // POINT 3 - Calculate the point 2 seconds ahead at max speed and in goal lane
           vector<double> goal_xy;
@@ -350,8 +344,8 @@ int main() {
             map_waypoints_s, \
             map_waypoints_x, \
             map_waypoints_y);
-          planningpath_x.push_back(goal_xy[0]);
-          planningpath_y.push_back(goal_xy[1]);
+          planningpath_x_Fr0.push_back(goal_xy[0]);
+          planningpath_y_Fr0.push_back(goal_xy[1]);
 
           // POINT 4 - Calculate the point 2.5 seconds ahead at max speed and in goal lane
           //vector<double> goal_xy;
@@ -360,66 +354,80 @@ int main() {
                      map_waypoints_s, \
                      map_waypoints_x, \
                      map_waypoints_y);
-          planningpath_x.push_back(goal_xy[0]);
-          planningpath_y.push_back(goal_xy[1]);
+          planningpath_x_Fr0.push_back(goal_xy[0]);
+          planningpath_y_Fr0.push_back(goal_xy[1]);
 
           // transform from global reference frame to ego vehicle reference frame
-          for (int i = 0; i < planningpath_x.size(); i++) {
+		  // https://en.wikipedia.org/wiki/Rotation_of_axes
+          for (int i = 0; i < planningpath_x_Fr0.size(); i++) {
             // shift
-            planningpath_x[i] -= ego_px;
-            planningpath_y[i] -= ego_py;
+			double shift_x = planningpath_x_Fr0[i] - ego_px;
+			double shift_y = planningpath_y_Fr0[i] - ego_py;
             // rotate
-            planningpath_x[i] =   planningpath_x[i] * cos(-ego_heading_rad) \
-                                - planningpath_y[i] * sin(-ego_heading_rad);
-            planningpath_y[i] =   planningpath_x[i] * sin(-ego_heading_rad) \
-                                + planningpath_y[i] * cos(-ego_heading_rad);
+            planningpath_x_Fr1.push_back( shift_x * cos(ego_heading_rad) + shift_y * sin(ego_heading_rad));
+            planningpath_y_Fr1.push_back(-shift_x * sin(ego_heading_rad) + shift_y * cos(ego_heading_rad));
           }
-
-          cout << planningpath_x[0] << "\t" << planningpath_y[0] << "\t" \
-               << planningpath_x[1] << "\t" << planningpath_y[1] << "\t" \
-               << planningpath_x[2] << "\t" << planningpath_y[2] << "\t" \
-               << planningpath_x[3] << "\t" << planningpath_y[3] << "\t" \
+#if(0)
+          cout << planningpath_x_Fr1[0] << "\t" << planningpath_y_Fr1[0] << "\t" \
+               << planningpath_x_Fr1[1] << "\t" << planningpath_y_Fr1[1] << "\t" \
+               << planningpath_x_Fr1[2] << "\t" << planningpath_y_Fr1[2] << "\t" \
+               << planningpath_x_Fr1[3] << "\t" << planningpath_y_Fr1[3] << "\t" \
                << endl;
-
+#endif
           //*********************************
           // Build the planning_path_spline
           //*********************************
           tk::spline planning_path_spline;
-          planning_path_spline.set_points(planningpath_x, planningpath_y);
+          planning_path_spline.set_points(planningpath_x_Fr1, planningpath_y_Fr1);
 
           // ********************
           // Build path request
           // ********************
-          vector<double> next_x_vals, next_y_vals; // ego vehicle desired x/y-position in global frame, send to motion control / simulator
+          vector<double> next_x_vals, next_y_vals; // ego vehicle desired x/y-position in GLOBAL frame, Fr0, to send to motion control / simulator
+
+#if(0)
+		  // Load up the planning path with the unused points from the previous path
+		  for (int i = 0; i < previous_path_x.size(); i++) {
+			  planningpath_x_Fr0.push_back(previous_path_x[i]);
+			  planningpath_y_Fr0.push_back(previous_path_y[i]);
+		  }
+#endif
 
           double future_ego_longvel = ego_longvel_mps;
-          double accel_demand, accel_demand_z1;
+          double accel_demand=0., accel_demand_z1=0.;
 
-          for (int i = 0; i < 50; i++) {
+          for (int i = 0; i < 20; i++) {
             if (future_ego_longvel < goal_longvel) { // need to accelerate
-              accel_demand = (goal_longvel - future_ego_longvel) * MAX_ACCELERATION_MPSS;
+              //accel_demand = (goal_longvel - future_ego_longvel) * MAX_ACCELERATION_MPSS;
+			  accel_demand = MAX_ACCELERATION_MPSS;
             } else if (future_ego_longvel > goal_longvel) { // need to decelerate
-              accel_demand = (goal_longvel - future_ego_longvel) * MAX_ACCELERATION_MPSS;
+              //accel_demand = (goal_longvel - future_ego_longvel) * MAX_ACCELERATION_MPSS;
+			  accel_demand = -MAX_ACCELERATION_MPSS;
             } else { 
               // maintain speed
               accel_demand = 0.;
             }
-
+#if(1)
+			cout << "unlimited: " << accel_demand << "\t";
+#endif
             //limit jerk            
             accel_demand = TIME_STEP_sec * max(-MAX_JERK_MPSSS, min(MAX_JERK_MPSSS, (accel_demand - accel_demand_z1) / TIME_STEP_sec));
             future_ego_longvel += accel_demand * TIME_STEP_sec;
             accel_demand_z1 = accel_demand;
-
-            double future_x, future_y; // future ego xy-position in vehicle frame
-            future_x = future_ego_longvel * i *TIME_STEP_sec;
+#if(1)
+			cout << "limited: " << accel_demand << "\t";
+#endif
+            double future_x, future_y; // future ego xy-position in EGO_VEHICLE frame, Fr1
+            future_x = future_ego_longvel * (i+1) * TIME_STEP_sec;
             future_y = planning_path_spline(future_x);
-
-            // swing back to global reference frame
+#if(1)
+			cout << "future_x: " << future_x << "\t";
+			cout << "future_y: " << future_y << "\t";
+#endif
+            // swing back to GLOBAL reference frame, Fr0
             // rotate
-            future_x =   future_x * cos(ego_heading_rad) \
-                       - future_y * sin(ego_heading_rad);
-            future_y =   future_x * sin(ego_heading_rad) \
-                       + future_y * cos(ego_heading_rad);
+            future_x = future_x * cos(ego_heading_rad) - future_y * sin(ego_heading_rad);
+            future_y = future_x * sin(ego_heading_rad) + future_y * cos(ego_heading_rad);
 
             // shift
             future_x += ego_px;
@@ -428,7 +436,9 @@ int main() {
             next_x_vals.push_back(future_x);
             next_y_vals.push_back(future_y);
           }
-
+#if(1)
+		  cout << endl << endl;
+#endif
 
           //END
           msgJson["next_x"] = next_x_vals;
