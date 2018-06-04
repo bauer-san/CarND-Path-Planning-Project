@@ -11,6 +11,11 @@
 #include "json.hpp"
 #include "spline.h"
 
+#define DBG_CSV 1
+#define DBG_CONSOLE 0
+
+#define NUM_NEXT_PTS_TO_SIM 50
+
 // UNIT CONVERSIONS
 #define KPH2MPS(x) (double)x / 3.6                             //
 #define MPH2MPS(x) KPH2MPS((double)x*8./5.)                    //
@@ -19,8 +24,8 @@
 #define MAX_TARGET_SPEED_MPS KPH2MPS((double)80.0 * (1-0.05))  // 80 kph * 3.6 mps/kph, 5% margin
 #define LANE_WIDTH_M 4.0                                       // nominal lane width is 4.0m
 #define GETLANE(d) ((int)d / LANE_WIDTH_M)                     // given d, return lane
-#define MAX_ACCELERATION_MPSS (double)10.0 * (1.-0.25)          // 10 mpss given in requirements, 25% margin
-#define MAX_JERK_MPSSS (double)50.0 * (1.-0.25)                 // 50 mpsss given in requirements, 25% margin
+#define MAX_ACCELERATION_MPSS (double)10.0 * (1.-0.1)          // 10 mpss given in requirements, 10% margin
+#define MAX_JERK_MPSSS (double)50.0 * (1.-0.1)                 // 50 mpsss given in requirements, 10% margin
 
 enum sensor_fusion_t { ID, PX, PY, VX, VY, S, D};
 enum lane_t {left_lane, middle_lane, right_lane, num_lanes};
@@ -226,8 +231,25 @@ int main() {
   	map_waypoints_dx.push_back(d_x);
   	map_waypoints_dy.push_back(d_y);
   }
+#if(DBG_CSV)
+  ofstream CSVFILE("output.csv");
+  CSVFILE << "ego_px" << ", ";
+  CSVFILE << "ego_py" << ", ";
+  CSVFILE << "ego_s" << ", ";
+  CSVFILE << "ego_d" << ", ";
+  CSVFILE << "ego_heading_rad" << ", ";
+  CSVFILE << "ego_longvel_mps" << ", ";
+    for (int i = 0; i < NUM_NEXT_PTS_TO_SIM; i++) {
+      CSVFILE << "unlim accel_demand" << i << ", ";
+      CSVFILE << "future_ego_longvel_mps" << i << ", ";
+      CSVFILE << "lim accel_demand" << i << ", ";
+      CSVFILE << "future_x" << i << ", ";
+//      CSVFILE << "future_y" << i << ", ";
+    }
+  CSVFILE << endl;
+#endif
 
-  h.onMessage([&map_waypoints_x, &map_waypoints_y, &map_waypoints_s, &map_waypoints_dx, &map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  h.onMessage([&map_waypoints_x, &map_waypoints_y, &map_waypoints_s, &map_waypoints_dx, &map_waypoints_dy, &CSVFILE](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
     uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -247,13 +269,20 @@ int main() {
           // j[1] is the data JSON object
 
           // Main car's localization Data
-          double ego_px = j[1]["x"];
-          double ego_py = j[1]["y"];
-          double ego_s = j[1]["s"];
-          double ego_d = j[1]["d"];
-          double ego_heading_rad = deg2rad(j[1]["yaw"]);
-          double ego_longvel_mps = MPH2MPS(j[1]["speed"]);
-
+          double ego_px = j[1]["x"];  // units: meters?
+          double ego_py = j[1]["y"];  // units: meters?
+          double ego_s = j[1]["s"];  // units: meters?
+          double ego_d = j[1]["d"];  // units: meters?
+          double ego_heading_rad = deg2rad(j[1]["yaw"]);   // units: radians?
+          double ego_longvel_mps = MPH2MPS(j[1]["speed"]);  // units: m/s?
+#if(DBG_CSV)
+          CSVFILE << ego_px << ", ";
+          CSVFILE << ego_py << ", ";
+          CSVFILE << ego_s << ", ";
+          CSVFILE << ego_d << ", ";
+          CSVFILE << ego_heading_rad << ", ";
+          CSVFILE << ego_longvel_mps << ", ";
+#endif
           // Previous path data given to the Planner
           auto previous_path_x = j[1]["previous_path_x"];
           auto previous_path_y = j[1]["previous_path_y"];
@@ -290,30 +319,30 @@ int main() {
           //cout << "Lane " << ego_lane+1 << ":\t" << "ID: " << ClosestTrafficParticipant_in_lane[ego_lane].ID << "\tdeltaS: " << ClosestTrafficParticipant_in_lane[ego_lane].deltaS << endl;
 
           // Initialize goal state to stay in lane
-          double goal_longvel = MAX_TARGET_SPEED_MPS;
+          double goal_longvel_mps = MAX_TARGET_SPEED_MPS;
           int goal_lane = middle_lane;  
 
 #if(0)
           // TODO: use state machine, build a path for each possible transition, calculate cost function, and then choose state with lowest cost
           if (left_lane == ego_lane) { //check straight and LCR
             //if ego slow
-            if (   ego_longvel_mps < goal_longvel \
+            if (   ego_longvel_mps < goal_longvel_mps \
                 && ClosestTrafficParticipant_in_lane[middle_lane].longvel > ego_longvel_mps) { 
               goal_lane = middle_lane;
             }
           }
           else if (middle_lane == ego_lane) { // check straight, LCR, and LCL
-            if (ego_longvel_mps < goal_longvel \
+            if (ego_longvel_mps < goal_longvel_mps \
               && ClosestTrafficParticipant_in_lane[right_lane].longvel > ego_longvel_mps) {
               goal_lane = right_lane;
             }
-            if (ego_longvel_mps < goal_longvel \
+            if (ego_longvel_mps < goal_longvel_mps \
               && ClosestTrafficParticipant_in_lane[left_lane].longvel > ego_longvel_mps) {
               goal_lane = left_lane;
             }
           }
           else if (right_lane == ego_lane) { // check straight and LCL
-            if (ego_longvel_mps < goal_longvel \
+            if (ego_longvel_mps < goal_longvel_mps \
               && ClosestTrafficParticipant_in_lane[middle_lane].longvel > ego_longvel_mps) {
               goal_lane = middle_lane;
             }
@@ -327,9 +356,9 @@ int main() {
           // Trust spline to do the smoothing
           //***********************************
           vector<double> planningpath_x_Fr0, planningpath_y_Fr0; // ego vehicle x/y-position in GLOBAL frame, Fr0
-		  vector<double> planningpath_x_Fr1, planningpath_y_Fr1; // ego vehicle x/y-position in EGO_VEHICLE frame, Fr1
+		      vector<double> planningpath_x_Fr1, planningpath_y_Fr1; // ego vehicle x/y-position in EGO_VEHICLE frame, Fr1
 
-		  // POINT 1 - Include the vehicle's current position
+		      // POINT 1 - Include the vehicle's current position
           planningpath_x_Fr0.push_back(ego_px);
           planningpath_y_Fr0.push_back(ego_py);
 
@@ -337,9 +366,9 @@ int main() {
           planningpath_x_Fr0.push_back(ego_px + KPH2MPS(10.)*cos(ego_heading_rad)*TIME_STEP_sec);
           planningpath_y_Fr0.push_back(ego_py + KPH2MPS(10.)*sin(ego_heading_rad)*TIME_STEP_sec);
 
-          // POINT 3 - Calculate the point 2 seconds ahead at max speed and in goal lane
+          // POINT 3 - Calculate the point 1 seconds ahead at max speed and in goal lane
           vector<double> goal_xy;
-          goal_xy = getXY(ego_s + MAX_TARGET_SPEED_MPS*2.0, \
+          goal_xy = getXY(ego_s + MAX_TARGET_SPEED_MPS*1.0, \
             (goal_lane * 4) + 2, \
             map_waypoints_s, \
             map_waypoints_x, \
@@ -358,11 +387,11 @@ int main() {
           planningpath_y_Fr0.push_back(goal_xy[1]);
 
           // transform from global reference frame to ego vehicle reference frame
-		  // https://en.wikipedia.org/wiki/Rotation_of_axes
+		      // https://en.wikipedia.org/wiki/Rotation_of_axes
           for (int i = 0; i < planningpath_x_Fr0.size(); i++) {
             // shift
-			double shift_x = planningpath_x_Fr0[i] - ego_px;
-			double shift_y = planningpath_y_Fr0[i] - ego_py;
+			      double shift_x = planningpath_x_Fr0[i] - ego_px;
+			      double shift_y = planningpath_y_Fr0[i] - ego_py;
             // rotate
             planningpath_x_Fr1.push_back( shift_x * cos(ego_heading_rad) + shift_y * sin(ego_heading_rad));
             planningpath_y_Fr1.push_back(-shift_x * sin(ego_heading_rad) + shift_y * cos(ego_heading_rad));
@@ -385,44 +414,59 @@ int main() {
           // ********************
           vector<double> next_x_vals, next_y_vals; // ego vehicle desired x/y-position in GLOBAL frame, Fr0, to send to motion control / simulator
 
-#if(0)
-		  // Load up the planning path with the unused points from the previous path
-		  for (int i = 0; i < previous_path_x.size(); i++) {
-			  planningpath_x_Fr0.push_back(previous_path_x[i]);
-			  planningpath_y_Fr0.push_back(previous_path_y[i]);
-		  }
+#if(1)
+		      // Load up the planning path with the unused points from the previous path
+		      for (int i = 0; i < previous_path_x.size(); i++) {
+			      planningpath_x_Fr0.push_back(previous_path_x[i]);
+			      planningpath_y_Fr0.push_back(previous_path_y[i]);
+		      }
 #endif
 
-          double future_ego_longvel = ego_longvel_mps;
+          double future_ego_longvel_mps = ego_longvel_mps;
           double accel_demand=0., accel_demand_z1=0.;
-
-          for (int i = 0; i < 20; i++) {
-            if (future_ego_longvel < goal_longvel) { // need to accelerate
-              //accel_demand = (goal_longvel - future_ego_longvel) * MAX_ACCELERATION_MPSS;
-			  accel_demand = MAX_ACCELERATION_MPSS;
-            } else if (future_ego_longvel > goal_longvel) { // need to decelerate
-              //accel_demand = (goal_longvel - future_ego_longvel) * MAX_ACCELERATION_MPSS;
-			  accel_demand = -MAX_ACCELERATION_MPSS;
+          double future_x_z1 = 0.;
+#if(1)
+          cout << previous_path_x.size() << endl;
+          for (int i = 0; i < (NUM_NEXT_PTS_TO_SIM - previous_path_x.size()); i++) {
+#else
+          for (int i = 0; i < NUM_NEXT_PTS_TO_SIM; i++) {
+#endif
+            if (future_ego_longvel_mps < goal_longvel_mps) { // need to accelerate
+			        accel_demand = MAX_ACCELERATION_MPSS;
+            } else if (future_ego_longvel_mps > goal_longvel_mps) { // need to decelerate
+			        accel_demand = -MAX_ACCELERATION_MPSS;
             } else { 
               // maintain speed
               accel_demand = 0.;
             }
-#if(1)
-			cout << "unlimited: " << accel_demand << "\t";
+#if(DBG_CONSOLE)
+			cout << "accel_demand: " << accel_demand << "\t";
+#endif
+#if(DBG_CSV)
+      CSVFILE << accel_demand << ", ";
 #endif
             //limit jerk            
             accel_demand = TIME_STEP_sec * max(-MAX_JERK_MPSSS, min(MAX_JERK_MPSSS, (accel_demand - accel_demand_z1) / TIME_STEP_sec));
-            future_ego_longvel += accel_demand * TIME_STEP_sec;
+            future_ego_longvel_mps += accel_demand * TIME_STEP_sec;
             accel_demand_z1 = accel_demand;
-#if(1)
-			cout << "limited: " << accel_demand << "\t";
+#if(DBG_CONSOLE)
+			cout << "lim. accel. demand: " << accel_demand << "\t";
+#endif
+#if(DBG_CSV)
+      CSVFILE << future_ego_longvel_mps << ", ";
+      CSVFILE << accel_demand << ", ";
 #endif
             double future_x, future_y; // future ego xy-position in EGO_VEHICLE frame, Fr1
-            future_x = future_ego_longvel * (i+1) * TIME_STEP_sec;
+            future_x = future_x_z1 + future_ego_longvel_mps * TIME_STEP_sec;
+            future_x_z1 = future_x;
             future_y = planning_path_spline(future_x);
-#if(1)
+#if(DBG_CONSOLE)
 			cout << "future_x: " << future_x << "\t";
 			cout << "future_y: " << future_y << "\t";
+#endif
+#if(DBG_CSV)
+      CSVFILE << future_x << ", ";
+//      CSVFILE << future_y << ", ";
 #endif
             // swing back to GLOBAL reference frame, Fr0
             // rotate
@@ -436,10 +480,12 @@ int main() {
             next_x_vals.push_back(future_x);
             next_y_vals.push_back(future_y);
           }
-#if(1)
+#if(DBG_CONSOLE)
 		  cout << endl << endl;
 #endif
-
+#if (DBG_CSV)
+      CSVFILE << endl;
+#endif
           //END
           msgJson["next_x"] = next_x_vals;
           msgJson["next_y"] = next_y_vals;
